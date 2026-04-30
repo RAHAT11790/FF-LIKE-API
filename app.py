@@ -83,7 +83,7 @@ async def generate_jwt_token(uid, password):
     """Generate JWT token"""
     try:
         encoded_password = urllib.parse.quote(password)
-        url = f"http://157.15.98.85:25565/generate-jwt?uid={uid}&password={encoded_password}"
+        url = f"https://ff-jwt-token-pi.vercel.app/get?uid={uid}&password={encoded_password}"
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=24) as response:
