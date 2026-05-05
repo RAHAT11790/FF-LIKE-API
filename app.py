@@ -1,22 +1,27 @@
-# FREE FIRE LIKE API - VERCEL SERVERLESS
-import json
+# FREE FIRE LIKE API - BD SERVER ONLY (TOKEN BASED)
+from flask import Flask, request, jsonify
 import asyncio
-import requests
-import time
-import random
-from datetime import datetime
-from collections import defaultdict
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf.json_format import MessageToJson
+import binascii
+import aiohttp
+import requests
+import json
 import like_pb2
 import like_count_pb2
 import uid_generator_pb2
+import time
+from collections import defaultdict
+from datetime import datetime
+import random
+import os
 
-# In-memory storage (Vercel এ কাজ করবে কিন্তু রিস্টার্ট হলে রিসেট হবে)
-tracker = {}
-liked_cache = {}
+app = Flask(__name__)
+
 KEY_LIMIT = 90
+tracker = defaultdict(lambda: [0, time.time()])
+liked_cache = defaultdict(set)
 
 def get_today_midnight_timestamp():
     now = datetime.now()
@@ -24,10 +29,17 @@ def get_today_midnight_timestamp():
     return midnight.timestamp()
 
 def load_tokens():
-    """Load tokens from JSON file"""
+    """Load tokens from tokens_bd.json - Format: [{"token": "..."}]"""
+    filename = "tokens_bd.json"
+    
+    if not os.path.exists(filename):
+        print(f"❌ {filename} not found")
+        return []
+    
     try:
-        with open("tokens_bd.json", "r", encoding="utf-8") as f:
+        with open(filename, "r", encoding="utf-8") as f:
             data = json.load(f)
+            
             tokens = []
             if isinstance(data, list):
                 for item in data:
@@ -37,8 +49,12 @@ def load_tokens():
                             tokens.append(token)
                     elif isinstance(item, str):
                         tokens.append(item.strip())
+            
+            print(f"✅ Loaded {len(tokens)} tokens from {filename}")
             return tokens
-    except:
+            
+    except Exception as e:
+        print(f"❌ Error loading tokens: {e}")
         return []
 
 def encrypt_message(plaintext):
@@ -46,13 +62,81 @@ def encrypt_message(plaintext):
     iv = b'6oyZDr22E3ychjM%'
     cipher = AES.new(key, AES.MODE_CBC, iv)
     padded_message = pad(plaintext, AES.block_size)
-    return cipher.encrypt(padded_message).hex()
+    return binascii.hexlify(cipher.encrypt(padded_message)).decode('utf-8')
 
 def create_protobuf_message(user_id, region):
     message = like_pb2.like()
     message.uid = int(user_id)
     message.region = region
     return message.SerializeToString()
+
+async def send_like(encrypted_uid, token, url):
+    try:
+        edata = bytes.fromhex(encrypted_uid)
+        headers = {
+            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            'Authorization': f"Bearer {token}",
+            'Content-Type': "application/x-www-form-urlencoded",
+            'X-GA': "v1 1",
+            'ReleaseVersion': "OB53"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=edata, headers=headers, timeout=5) as response:
+                return response.status
+    except:
+        return 500
+
+async def process_token(target_uid, encrypted_uid, token, url, semaphore):
+    async with semaphore:
+        status = await send_like(encrypted_uid, token, url)
+        if status == 200:
+            liked_cache[target_uid].add(token)
+        return status
+
+async def send_all_likes(target_uid, server_name, url):
+    region = server_name
+    protobuf_message = create_protobuf_message(target_uid, region)
+    encrypted_uid = encrypt_message(protobuf_message)
+    
+    tokens = load_tokens()
+    if not tokens:
+        return {'success': 0, 'failed': 0, 'total': 0}
+    
+    already_liked = liked_cache.get(target_uid, set())
+    fresh_tokens = [t for t in tokens if t not in already_liked]
+    
+    print(f"📊 Total tokens: {len(tokens)}")
+    print(f"✅ Fresh tokens: {len(fresh_tokens)}")
+    print(f"⏭️ Already liked: {len(already_liked)}")
+    
+    if not fresh_tokens:
+        return {
+            'success': 0,
+            'failed': 0,
+            'total': len(tokens),
+            'already_liked': len(already_liked)
+        }
+    
+    random.shuffle(fresh_tokens)
+    semaphore = asyncio.Semaphore(25)
+    tasks = []
+    
+    for token in fresh_tokens[:500]:
+        tasks.append(process_token(target_uid, encrypted_uid, token, url, semaphore))
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    successful = sum(1 for r in results if r == 200)
+    failed = sum(1 for r in results if isinstance(r, int) and r != 200)
+    
+    return {
+        'success': successful,
+        'failed': failed,
+        'total': len(tokens),
+        'already_liked': len(already_liked),
+        'fresh_used': len(fresh_tokens[:500])
+    }
 
 def enc(uid):
     message = uid_generator_pb2.uid_generator()
@@ -68,8 +152,14 @@ def decode_protobuf(binary):
     except:
         return None
 
-def get_player_info(encrypted_uid, token):
-    url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
+def get_player_info(encrypted_uid, server_name, token):
+    if server_name == "IND":
+        url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
+    elif server_name in {"BR", "US", "SAC", "NA"}:
+        url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
+    else:
+        url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
+
     edata = bytes.fromhex(encrypted_uid)
     headers = {
         'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
@@ -78,217 +168,111 @@ def get_player_info(encrypted_uid, token):
         'X-GA': "v1 1",
         'ReleaseVersion': "OB53"
     }
+
     try:
         response = requests.post(url, data=edata, headers=headers, verify=False, timeout=10)
         return decode_protobuf(response.content)
     except:
         return None
 
-def send_like(encrypted_uid, token):
-    url = "https://clientbp.ggpolarbear.com/LikeProfile"
-    edata = bytes.fromhex(encrypted_uid)
-    headers = {
-        'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-        'Authorization': f"Bearer {token}",
-        'Content-Type': "application/x-www-form-urlencoded",
-        'X-GA': "v1 1",
-        'ReleaseVersion': "OB53"
-    }
-    try:
-        response = requests.post(url, data=edata, headers=headers, timeout=10)
-        return response.status_code
-    except:
-        return 500
+@app.route('/like', methods=['GET'])
+def handle_requests():
+    uid = request.args.get("uid")
+    server_name = request.args.get("server_name", "").upper()
+    key = request.args.get("key")
+    client_ip = request.remote_addr
 
-def handler(request):
-    """Vercel Serverless Function handler"""
-    
-    # Get query parameters
-    path = request.path
-    method = request.method
-    
-    # CORS headers
-    headers = {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type'
-    }
-    
-    if method == 'OPTIONS':
-        return {
-            'statusCode': 200,
-            'headers': headers,
-            'body': ''
-        }
-    
-    # Home route
-    if path == '/' or path == '/api':
-        return {
-            'statusCode': 200,
-            'headers': headers,
-            'body': json.dumps({
-                "status": "active",
-                "service": "Free Fire Like API",
-                "server": "BD Only",
-                "endpoints": {
-                    "/api/like": "Send likes (uid, key required)",
-                    "/api/stats": "Get stats (key required)"
-                }
-            })
-        }
-    
-    # Like route
-    if path == '/api/like':
-        uid = request.args.get('uid')
-        key = request.args.get('key')
-        client_ip = request.headers.get('x-forwarded-for', 'unknown')
-        
-        if key != "RS":
-            return {
-                'statusCode': 403,
-                'headers': headers,
-                'body': json.dumps({"success": False, "error": "Invalid API key"})
-            }
-        
-        if not uid:
-            return {
-                'statusCode': 400,
-                'headers': headers,
-                'body': json.dumps({"success": False, "error": "UID required"})
-            }
-        
-        # Check daily limit
-        today_midnight = get_today_midnight_timestamp()
-        if client_ip not in tracker:
-            tracker[client_ip] = [0, time.time()]
-        
-        count, last_reset = tracker[client_ip]
-        if last_reset < today_midnight:
-            tracker[client_ip] = [0, time.time()]
-            count = 0
-        
-        if count >= KEY_LIMIT:
-            return {
-                'statusCode': 429,
-                'headers': headers,
-                'body': json.dumps({"success": False, "error": f"Daily limit reached (0/{KEY_LIMIT})"})
-            }
-        
-        # Load tokens
-        tokens = load_tokens()
-        if not tokens:
-            return {
-                'statusCode': 500,
-                'headers': headers,
-                'body': json.dumps({"success": False, "error": "No tokens available"})
-            }
-        
-        check_token = tokens[0]
-        encrypted_uid = enc(uid)
-        
-        # Get before likes
-        before = get_player_info(encrypted_uid, check_token)
-        if before is None:
-            return {
-                'statusCode': 200,
-                'headers': headers,
-                'body': json.dumps({"success": False, "error": "Invalid UID"})
-            }
-        
-        try:
-            before_data = json.loads(MessageToJson(before))
-            before_like = int(before_data['AccountInfo'].get('Likes', 0))
-            player_name = before_data['AccountInfo'].get('PlayerNickname', 'Unknown')
-            player_id = before_data['AccountInfo'].get('UID', uid)
-        except:
-            return {
-                'statusCode': 200,
-                'headers': headers,
-                'body': json.dumps({"success": False, "error": "Parse error"})
-            }
-        
-        # Send likes
-        region = "BD"
-        protobuf_message = create_protobuf_message(int(uid), region)
-        encrypted_uid_like = encrypt_message(protobuf_message)
-        
-        successful = 0
-        failed = 0
-        
-        # Track already liked
-        if uid not in liked_cache:
-            liked_cache[uid] = set()
-        
-        for token in tokens[:100]:  # Limit to 100 per request
-            if token in liked_cache[uid]:
-                continue
-            
-            status = send_like(encrypted_uid_like, token)
-            if status == 200:
-                successful += 1
-                liked_cache[uid].add(token)
-            else:
-                failed += 1
-            
-            await asyncio.sleep(0.1)  # Rate limit
-        
-        # Get after likes
-        after = get_player_info(encrypted_uid, check_token)
-        after_like = before_like
-        
-        if after:
-            try:
-                after_data = json.loads(MessageToJson(after))
-                after_like = int(after_data['AccountInfo'].get('Likes', before_like))
-            except:
-                pass
+    if key != "RS":
+        return jsonify({"error": "Invalid API key"}), 403
+
+    if not uid or not server_name:
+        return jsonify({"error": "UID and server_name required"}), 400
+
+    valid_servers = ["IND", "BR", "US", "SAC", "NA", "BD", "RU"]
+    if server_name not in valid_servers:
+        return jsonify({"error": f"Invalid server. Use: {valid_servers}"}), 400
+
+    tokens = load_tokens()
+    if not tokens:
+        return jsonify({"error": "No tokens found"}), 500
+
+    check_token = tokens[0]
+
+    today_midnight = get_today_midnight_timestamp()
+    count, last_reset = tracker[client_ip]
+
+    if last_reset < today_midnight:
+        tracker[client_ip] = [0, time.time()]
+        count = 0
+
+    if count >= KEY_LIMIT:
+        return jsonify({"error": "Daily limit reached", "remains": f"(0/{KEY_LIMIT})"}), 429
+
+    encrypted_uid = enc(uid)
+
+    before = get_player_info(encrypted_uid, server_name, check_token)
+    if before is None:
+        return jsonify({"error": "Invalid UID or server", "status": 0}), 200
+
+    try:
+        before_data = json.loads(MessageToJson(before))
+        before_like = int(before_data['AccountInfo'].get('Likes', 0))
+    except:
+        return jsonify({"error": "Data parsing failed", "status": 0}), 200
+
+    if server_name == "IND":
+        like_url = "https://client.ind.freefiremobile.com/LikeProfile"
+    elif server_name in {"BR", "US", "SAC", "NA"}:
+        like_url = "https://client.us.freefiremobile.com/LikeProfile"
+    else:
+        like_url = "https://clientbp.ggpolarbear.com/LikeProfile"
+
+    result = asyncio.run(send_all_likes(uid, server_name, like_url))
+
+    after = get_player_info(encrypted_uid, server_name, check_token)
+    if after is None:
+        return jsonify({"error": "Could not verify likes", "status": 0}), 200
+
+    try:
+        after_data = json.loads(MessageToJson(after))
+        after_like = int(after_data['AccountInfo']['Likes'])
+        player_id = int(after_data['AccountInfo']['UID'])
+        player_name = str(after_data['AccountInfo']['PlayerNickname'])
         
         like_given = after_like - before_like
+        status = 1 if like_given != 0 else 2
         
         if like_given > 0:
-            tracker[client_ip] = [tracker[client_ip][0] + 1, tracker[client_ip][1]]
+            tracker[client_ip][0] += 1
         
-        return {
-            'statusCode': 200,
-            'headers': headers,
-            'body': json.dumps({
-                "success": True,
-                "uid": int(player_id),
-                "name": player_name,
-                "likes_before": before_like,
-                "likes_after": after_like,
-                "likes_given": like_given,
-                "tokens_used": successful,
-                "tokens_failed": failed,
-                "server": "BD"
-            })
-        }
+        remains = KEY_LIMIT - tracker[client_ip][0]
+
+        return jsonify({
+            "LikesGivenByAPI": like_given,
+            "LikesafterCommand": after_like,
+            "LikesbeforeCommand": before_like,
+            "PlayerNickname": player_name,
+            "UID": player_id,
+            "status": status,
+            "remains": f"({remains}/{KEY_LIMIT})"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "status": 0}), 500
+
+@app.route('/reset-cache', methods=['GET'])
+def reset_cache():
+    key = request.args.get("key")
+    if key != "STAR":
+        return jsonify({"error": "Invalid key"}), 403
     
-    # Stats route
-    if path == '/api/stats':
-        key = request.args.get('key')
-        if key != "RS":
-            return {
-                'statusCode': 403,
-                'headers': headers,
-                'body': json.dumps({"success": False, "error": "Invalid key"})
-            }
-        
-        tokens = load_tokens()
-        return {
-            'statusCode': 200,
-            'headers': headers,
-            'body': json.dumps({
-                "success": True,
-                "total_tokens": len(tokens),
-                "cached_entries": len(liked_cache),
-                "server": "BD"
-            })
-        }
-    
-    # 404
-    return {
-        'statusCode': 404,
-        'headers': headers,
-        'body': json.dumps({"error": "Not found"})
-    }
+    global liked_cache
+    liked_cache.clear()
+    return jsonify({"message": "Cache cleared"})
+
+if __name__ == '__main__':
+    print("="*50)
+    print("TOKEN BASED LIKE API")
+    print("="*50)
+    print("Token file: tokens_bd.json")
+    print("Format: [{\"token\": \"...\"}]")
+    app.run(host='0.0.0.0', port=5001, debug=True)
